@@ -1,17 +1,18 @@
 ﻿<!--
-  深度重构版 (2026-05-24)
-  1. 弹窗拦截自动暂停，用户允许后可点击“重试当前”继续，符合原始交互需求。
-  2. 暂停时按钮布局：重试当前 / 取消任务 / 跳过当前，功能完整且不增加界面元素。
-  3. 非自动清理模式下跳过不必要的文本框更新，大幅提升大量链接时的性能。
-  4. 完全使用 var + function，无箭头函数/模板字符串，代码零简写。
-  5. 保留所有历史功能：5 套主题、延时设置、自动清理、精准进度、安全过滤、IndexedDB 等。
+  版本更新：V10.9 (2026-05-24)
+  本次更新内容：
+  1. 修复弹窗不稳定问题：增加弹窗拦截检测，在批量打开前自动测试浏览器弹窗策略。
+     若检测到拦截，将明确提示用户允许弹窗，避免任务执行中部分链接无法打开。
+  2. 优化打开流程：将测试窗口作为前置步骤，提高批量打开的稳定性。
+  3. 整体代码风格保持完全展开，无简写，所有功能与交互逻辑不变。
+  4. 提升用户引导体验，减少因弹窗策略导致的困惑。
 -->
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes, viewport-fit=cover">
-    <title>批量打开网页助手 · Pro</title>
+    <title>批量打开网页助手 · Pro V10.9</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E📂%3C/text%3E%3C/svg%3E">
     <style>
         /* ========== 经典深色主题（默认保留） ========== */
@@ -665,12 +666,13 @@
         <div class="loading-overlay" id="loadingOverlay">
             <div class="loading-spinner"></div>
         </div>
+
         <div class="app-header">
             <div class="header-left">
                 <div class="app-logo">📂</div>
                 <div>
                     <div class="app-title">批量打开网页助手</div>
-                    <div class="app-subtitle">Professional Edition</div>
+                    <div class="app-subtitle">Professional Edition V10.9</div>
                 </div>
             </div>
             <div class="theme-switcher" id="themeSwitcher">
@@ -681,6 +683,7 @@
                 <div class="theme-dot" data-theme="lavender" style="background:#8b5cf6;" title="罗兰紫"></div>
             </div>
         </div>
+
         <div class="app-body">
             <div class="input-section">
                 <div class="input-label">📋 网址列表（每行一个）</div>
@@ -688,6 +691,7 @@
             placeholder="https://www.google.com&#10;https://www.github.com&#10;https://www.stackoverflow.com"></textarea>
                 <div class="input-hint">💡 支持自动补全 https:// 前缀，每行一个网址</div>
             </div>
+
             <div class="control-section">
                 <div class="control-card">
                     <div class="card-title">⏱️ 延时设置</div>
@@ -717,6 +721,7 @@
                     </div>
                     <div class="status-message" id="statusMessage">就绪</div>
                 </div>
+
                 <div class="button-area">
                     <div class="button-grid">
                         <button class="btn btn-primary" id="openBtn">🚀 一键打开全部</button>
@@ -797,11 +802,12 @@
                 });
             }
 
+            // ---------- 存储持久化申请（静默处理） ----------
             function requestPersistence() {
                 if (navigator.storage && navigator.storage.persist) {
-                    navigator.storage.persist().then(function(isPersisted) {
-                        console.log(isPersisted ? '持久存储已激活' : '持久存储请求被拒绝');
-                    }).catch(function(err) { console.error(err); });
+                    navigator.storage.persist().catch(function() {
+                        // 静默忽略拒绝
+                    });
                 }
             }
 
@@ -815,6 +821,7 @@
             var enableDelay = false;                // 是否启用间隔
             var delaySeconds = 10;                  // 间隔秒数
             var autoClearEnabled = false;           // 自动清理开关
+            var popupBlocked = false;               // 弹窗是否被拦截（用于前置检测）
 
             // ---------- DOM 元素 ----------
             var urlInput = document.getElementById('urlInput');
@@ -839,24 +846,49 @@
                     autoClearEnabled: autoClearToggle.checked,
                     theme: document.body.getAttribute('data-theme') || 'dark'
                 };
+                // 主存储：IndexedDB
                 saveStateToDB(state).catch(function(err) {
                     console.warn('IndexedDB 保存失败，回退 localStorage', err);
                     try {
                         localStorage.setItem('batchOpenerProV6', JSON.stringify(state));
-                    } catch (e) {}
+                    } catch (e) {
+                        // 存储完全失败时静默
+                    }
                 });
             }
 
             function loadState() {
                 return loadStateFromDB().then(function(savedState) {
-                    if (savedState && savedState.urls !== undefined) return savedState;
+                    if (savedState && savedState.urls !== undefined) {
+                        return savedState;
+                    }
+                    // 回退到 localStorage
                     return new Promise(function(resolve) {
                         var ls = localStorage.getItem('batchOpenerProV6');
-                        resolve(ls ? JSON.parse(ls) : null);
+                        if (ls) {
+                            try {
+                                resolve(JSON.parse(ls));
+                            } catch (e) {
+                                resolve(null);
+                            }
+                        } else {
+                            resolve(null);
+                        }
                     });
                 }).catch(function() {
-                    var ls = localStorage.getItem('batchOpenerProV6');
-                    return ls ? JSON.parse(ls) : null;
+                    // IndexedDB 失败，尝试 localStorage
+                    return new Promise(function(resolve) {
+                        var ls = localStorage.getItem('batchOpenerProV6');
+                        if (ls) {
+                            try {
+                                resolve(JSON.parse(ls));
+                            } catch (e) {
+                                resolve(null);
+                            }
+                        } else {
+                            resolve(null);
+                        }
+                    });
                 });
             }
 
@@ -869,7 +901,9 @@
                     delayToggle.checked = enableDelay;
                     delayInput.value = delaySeconds;
                     autoClearToggle.checked = autoClearEnabled;
-                    if (state.theme) applyTheme(state.theme, false);
+                    if (state.theme) {
+                        applyTheme(state.theme, false);
+                    }
                 } else {
                     urlInput.value = 'https://www.google.com\nhttps://www.github.com\nhttps://www.stackoverflow.com';
                     delayToggle.checked = false;
@@ -879,90 +913,169 @@
             }
 
             var saveTimer;
-            function debouncedSave() { clearTimeout(saveTimer); saveTimer = setTimeout(saveState, 500); }
-            function immediateSave() { clearTimeout(saveTimer); saveState(); }
+            function debouncedSave() {
+                clearTimeout(saveTimer);
+                saveTimer = setTimeout(saveState, 500);
+            }
+            function immediateSave() {
+                clearTimeout(saveTimer);
+                saveState();
+            }
 
             // ---------- 主题切换 ----------
             function applyTheme(theme, save) {
                 if (save === undefined) save = true;
                 document.body.setAttribute('data-theme', theme);
                 var dots = document.querySelectorAll('.theme-dot');
-                dots.forEach(function(d) { d.classList.remove('active'); });
-                var dot = document.querySelector('.theme-dot[data-theme="' + theme + '"]');
-                if (dot) dot.classList.add('active');
-                var name = getComputedStyle(document.body).getPropertyValue('--theme-name').trim().replace(/['"]/g, '');
-                document.getElementById('themeName').textContent = name || theme;
-                if (save) immediateSave();
+                dots.forEach(function(dot) {
+                    dot.classList.remove('active');
+                });
+                var targetDot = document.querySelector('.theme-dot[data-theme="' + theme + '"]');
+                if (targetDot) {
+                    targetDot.classList.add('active');
+                }
+                var themeName = getComputedStyle(document.body).getPropertyValue('--theme-name').trim().replace(/['"]/g, '');
+                document.getElementById('themeName').textContent = themeName || theme;
+                if (save) {
+                    immediateSave();
+                }
             }
-            document.getElementById('themeSwitcher').addEventListener('click', function(e) {
-                var dot = e.target.closest('.theme-dot');
+
+            document.getElementById('themeSwitcher').addEventListener('click', function(event) {
+                var dot = event.target.closest('.theme-dot');
                 if (!dot) return;
                 applyTheme(dot.dataset.theme);
             });
 
-            // ---------- URL 安全过滤 ----------
+            // ---------- URL 安全过滤（强化版） ----------
             function normalizeUrl(rawUrl) {
                 var trimmed = rawUrl.trim();
                 if (!trimmed) return null;
+
+                // 直接拦截已知危险或非浏览器导航协议
+                var lowerTrimmed = trimmed.toLowerCase();
+                if (
+                    lowerTrimmed.indexOf('file:') === 0 ||
+                    lowerTrimmed.indexOf('javascript:') === 0 ||
+                    lowerTrimmed.indexOf('data:') === 0 ||
+                    lowerTrimmed.indexOf('vbscript:') === 0
+                ) {
+                    return null;
+                }
+
+                // 自动补全 http/https 前缀
                 var urlString = /^https?:\/\//i.test(trimmed) ? trimmed : 'https://' + trimmed;
                 try {
                     var urlObj = new URL(urlString);
-                    if (urlObj.protocol !== 'http:' && urlObj.protocol !== 'https:') return null;
+                    // 再次确认最终协议为 http 或 https
+                    if (urlObj.protocol !== 'http:' && urlObj.protocol !== 'https:') {
+                        return null;
+                    }
                     return urlObj.href;
-                } catch (e) { return null; }
+                } catch (e) {
+                    return null;
+                }
             }
 
             // ---------- UI 更新 ----------
-            function setStatus(msg, type) {
-                statusMessage.textContent = msg;
+            function setStatus(message, type) {
+                statusMessage.textContent = message;
                 statusMessage.className = 'status-message ' + (type || '');
             }
+
             function updateProgress() {
                 if (openState === 'idle') {
-                    progressFill.style.width = '0%'; progressText.textContent = '0/0'; return;
+                    progressFill.style.width = '0%';
+                    progressText.textContent = '0/0';
+                    return;
                 }
                 var percent = totalToOpen > 0 ? (completedCount / totalToOpen) * 100 : 0;
                 progressFill.style.width = percent + '%';
                 progressText.textContent = completedCount + '/' + totalToOpen;
             }
+
             function updateButtons() {
                 if (openState === 'opening') {
                     openBtn.disabled = true;
-                    pauseBtn.disabled = false; pauseBtn.textContent = '⏸️ 暂停';
-                    cancelBtn.disabled = false; cancelBtn.textContent = '❌ 取消'; cancelBtn.className = 'btn btn-danger';
-                    clearBtn.disabled = true; clearBtn.textContent = '🗑️ 清空列表'; clearBtn.className = 'btn btn-secondary';
+                    pauseBtn.disabled = false;
+                    pauseBtn.textContent = '⏸️ 暂停';
+                    cancelBtn.disabled = false;
+                    cancelBtn.textContent = '❌ 取消';
+                    cancelBtn.className = 'btn btn-danger';
+                    clearBtn.disabled = true;
+                    clearBtn.textContent = '🗑️ 清空列表';
+                    clearBtn.className = 'btn btn-secondary';
                 } else if (openState === 'paused') {
                     openBtn.disabled = true;
-                    pauseBtn.disabled = false; pauseBtn.textContent = '🔄 重试当前'; pauseBtn.className = 'btn btn-secondary';
-                    cancelBtn.disabled = false; cancelBtn.textContent = '❌ 取消任务'; cancelBtn.className = 'btn btn-danger';
-                    clearBtn.disabled = false; clearBtn.textContent = '⏭️ 跳过当前'; clearBtn.className = 'btn btn-danger';
+                    pauseBtn.disabled = false;
+                    pauseBtn.textContent = '🔄 重试当前';
+                    pauseBtn.className = 'btn btn-secondary';
+                    cancelBtn.disabled = false;
+                    cancelBtn.textContent = '❌ 取消任务';
+                    cancelBtn.className = 'btn btn-danger';
+                    clearBtn.disabled = false;
+                    clearBtn.textContent = '⏭️ 跳过当前';
+                    clearBtn.className = 'btn btn-danger';
                 } else {
                     openBtn.disabled = false;
-                    pauseBtn.disabled = true; pauseBtn.textContent = '⏸️ 暂停'; pauseBtn.className = 'btn btn-secondary';
-                    cancelBtn.disabled = true; cancelBtn.textContent = '❌ 取消'; cancelBtn.className = 'btn btn-danger';
-                    clearBtn.disabled = false; clearBtn.textContent = '🗑️ 清空列表'; clearBtn.className = 'btn btn-secondary';
+                    pauseBtn.disabled = true;
+                    pauseBtn.textContent = '⏸️ 暂停';
+                    pauseBtn.className = 'btn btn-secondary';
+                    cancelBtn.disabled = true;
+                    cancelBtn.textContent = '❌ 取消';
+                    cancelBtn.className = 'btn btn-danger';
+                    clearBtn.disabled = false;
+                    clearBtn.textContent = '🗑️ 清空列表';
+                    clearBtn.className = 'btn btn-secondary';
                 }
                 updateProgress();
             }
 
             function clearTimers() {
-                if (currentTimeout) { clearTimeout(currentTimeout); currentTimeout = null; }
+                if (currentTimeout) {
+                    clearTimeout(currentTimeout);
+                    currentTimeout = null;
+                }
             }
 
+            // ---------- 检测弹窗是否被拦截 ----------
+            function checkPopupBlocker() {
+                return new Promise(function(resolve) {
+                    // 尝试打开一个极小的空白窗口
+                    var testWin = window.open('about:blank', '_blank', 'width=1,height=1,left=-100,top=-100');
+                    if (testWin && !testWin.closed) {
+                        // 弹窗成功，立即关闭
+                        testWin.close();
+                        resolve(false); // 未被拦截
+                    } else {
+                        // 可能被拦截
+                        resolve(true); // 被拦截
+                    }
+                });
+            }
+
+            // ---------- 结束任务 ----------
             function finishTask(cancelled) {
                 clearTimers();
-                var done = completedCount, total = totalToOpen;
+                var done = completedCount;
+                var total = totalToOpen;
+
                 openState = 'idle';
                 if (cancelled) {
                     urlInput.value = urlList.join('\n');
                     setStatus('⛔ 已取消 (已完成 ' + done + '/' + total + ')，剩余链接已保留', 'warning');
                 } else {
-                    urlList = []; urlInput.value = '';
+                    urlList = [];
+                    urlInput.value = '';
                     setStatus('✅ 全部完成！共 ' + total + ' 个', 'success');
                 }
-                currentIndex = 0; totalToOpen = 0; completedCount = 0;
+
+                currentIndex = 0;
+                totalToOpen = 0;
+                completedCount = 0;
                 urlList = cancelled ? urlList : [];
-                updateButtons(); immediateSave();
+                updateButtons();
+                immediateSave();
             }
 
             // ---------- 打开网页（window.open + 单次 blur/focus，检测拦截） ----------
@@ -972,22 +1085,30 @@
                     setStatus('⚠️ 弹窗被拦截！请点击浏览器地址栏的“允许弹窗”，然后点击“重试当前”', 'error');
                     return false;
                 }
-                // 尝试让新窗口失去焦点，当前窗口获得焦点（尽力而为）
-                try { newWindow.blur(); } catch (e) {}
+                // 尽力让新窗口失去焦点
+                try {
+                    newWindow.blur();
+                } catch (e) { }
                 window.focus();
                 return true;
             }
 
             function openNext() {
                 if (openState !== 'opening') return;
-                if (completedCount >= totalToOpen) { finishTask(false); return; }
-                if (currentIndex >= urlList.length) { finishTask(false); return; }
+                if (completedCount >= totalToOpen) {
+                    finishTask(false);
+                    return;
+                }
+                if (currentIndex >= urlList.length) {
+                    finishTask(false);
+                    return;
+                }
 
                 var url = urlList[currentIndex];
                 var success = openUrl(url);
 
                 if (!success) {
-                    // 弹窗被拦截，自动暂停，保留当前 URL
+                    // 弹窗被拦截，自动暂停
                     openState = 'paused';
                     clearTimers();
                     updateButtons();
@@ -1011,7 +1132,10 @@
                 }
                 immediateSave();
 
-                if (completedCount >= totalToOpen) { finishTask(false); return; }
+                if (completedCount >= totalToOpen) {
+                    finishTask(false);
+                    return;
+                }
 
                 var delay = enableDelay ? delaySeconds * 1000 : 500;
                 setStatus('📌 正在打开 (' + (completedCount + 1) + '/' + totalToOpen + ')');
@@ -1023,46 +1147,80 @@
 
             // ---------- 按钮事件 ----------
             openBtn.addEventListener('click', function() {
-                if (openState !== 'idle') return setStatus('⚠️ 任务进行中，请先取消或等待完成', 'warning');
-                var lines = urlInput.value.split(/\r?\n/);
-                var validUrls = [];
-                lines.forEach(function(line) {
-                    var normalized = normalizeUrl(line);
-                    if (normalized && /^https?:\/\/[^\s]+/.test(normalized)) validUrls.push(normalized);
+                if (openState !== 'idle') {
+                    return setStatus('⚠️ 任务进行中，请先取消或等待完成', 'warning');
+                }
+
+                // 前置弹窗检测
+                setStatus('🔍 正在检测弹窗策略...', '');
+                checkPopupBlocker().then(function(blocked) {
+                    popupBlocked = blocked;
+                    if (blocked) {
+                        setStatus('🚫 弹窗已被浏览器拦截！请点击地址栏的弹窗图标并选择“始终允许此网站弹出窗口”，然后重试。', 'error');
+                        return;
+                    }
+
+                    // 弹窗未被拦截，继续解析网址
+                    var lines = urlInput.value.split(/\r?\n/);
+                    var validUrls = [];
+                    lines.forEach(function(line) {
+                        var normalized = normalizeUrl(line);
+                        if (normalized && /^https?:\/\/[^\s]+/.test(normalized)) {
+                            validUrls.push(normalized);
+                        } else if (line.trim()) {
+                            console.warn('跳过无效网址:', line);
+                        }
+                    });
+
+                    if (!validUrls.length) {
+                        return setStatus('❌ 没有有效的网址', 'error');
+                    }
+                    if (validUrls.length > 5000 && !confirm('即将打开 ' + validUrls.length + ' 个网页，数量较多，确定继续吗？')) {
+                        return setStatus('已取消');
+                    }
+
+                    enableDelay = delayToggle.checked;
+                    delaySeconds = parseInt(delayInput.value, 10) || 10;
+                    autoClearEnabled = autoClearToggle.checked;
+                    immediateSave();
+
+                    urlList = validUrls;
+                    totalToOpen = validUrls.length;
+                    currentIndex = 0;
+                    completedCount = 0;
+                    openState = 'opening';
+                    updateButtons();
+                    setStatus('🚀 开始打开 ' + totalToOpen + ' 个网页');
+                    openNext();
+                }).catch(function() {
+                    setStatus('❌ 检测弹窗时发生错误，请刷新页面后重试', 'error');
                 });
-                if (!validUrls.length) return setStatus('❌ 没有有效的网址', 'error');
-                if (validUrls.length > 5000 && !confirm('即将打开 ' + validUrls.length + ' 个网页，数量较多，确定继续吗？')) return setStatus('已取消');
-
-                enableDelay = delayToggle.checked;
-                delaySeconds = parseInt(delayInput.value, 10) || 10;
-                autoClearEnabled = autoClearToggle.checked;
-                immediateSave();
-
-                urlList = validUrls;
-                totalToOpen = validUrls.length;
-                currentIndex = 0; completedCount = 0;
-                openState = 'opening';
-                updateButtons();
-                setStatus('🚀 开始打开 ' + totalToOpen + ' 个网页');
-                openNext();
             });
 
             pauseBtn.addEventListener('click', function() {
                 if (openState === 'opening') {
-                    openState = 'paused'; clearTimers(); updateButtons();
+                    // 暂停
+                    openState = 'paused';
+                    clearTimers();
+                    updateButtons();
                     setStatus('⏸️ 已暂停 (' + completedCount + '/' + totalToOpen + ')', 'warning');
                 } else if (openState === 'paused') {
                     // 重试当前 URL（不跳过）
-                    openState = 'opening'; updateButtons();
+                    openState = 'opening';
+                    updateButtons();
                     setStatus('🔄 已重试当前链接，继续执行', '');
                     openNext();
-                } else setStatus('⚠️ 当前没有可暂停的任务', 'warning');
+                } else {
+                    setStatus('⚠️ 当前没有可暂停的任务', 'warning');
+                }
             });
 
             cancelBtn.addEventListener('click', function() {
-                if (openState === 'idle') return setStatus('⚠️ 没有正在进行的任务', 'warning');
+                if (openState === 'idle') {
+                    return setStatus('⚠️ 没有正在进行的任务', 'warning');
+                }
                 if (openState === 'paused') {
-                    // 暂停状态下 cancel 按钮为“取消任务”
+                    // 取消任务
                     finishTask(true);
                 } else {
                     // opening 状态正常取消
@@ -1072,48 +1230,92 @@
 
             clearBtn.addEventListener('click', function() {
                 if (openState === 'idle') {
-                    urlInput.value = ''; immediateSave(); setStatus('🧹 列表已清空', 'success');
+                    // 正常清空列表
+                    urlInput.value = '';
+                    immediateSave();
+                    setStatus('🧹 列表已清空', 'success');
                 } else if (openState === 'paused') {
                     // 暂停状态下，清空按钮临时变为“跳过当前”
                     if (currentIndex < urlList.length) {
                         completedCount++;
-                        if (autoClearEnabled) urlList.splice(currentIndex, 1);
-                        else currentIndex++;
+                        if (autoClearEnabled) {
+                            urlList.splice(currentIndex, 1);
+                        } else {
+                            currentIndex++;
+                        }
                         urlInput.value = urlList.join('\n');
-                        updateProgress(); immediateSave();
-                        if (completedCount >= totalToOpen) { finishTask(false); return; }
-                        openState = 'opening'; updateButtons();
+                        updateProgress();
+                        immediateSave();
+
+                        if (completedCount >= totalToOpen) {
+                            finishTask(false);
+                            return;
+                        }
+
+                        openState = 'opening';
+                        updateButtons();
                         setStatus('⏭️ 已跳过当前链接，继续执行 (' + (completedCount + 1) + '/' + totalToOpen + ')');
                         var delay = enableDelay ? delaySeconds * 1000 : 500;
-                        currentTimeout = setTimeout(function() { if (openState === 'opening') openNext(); }, delay);
-                    } else finishTask(false);
-                } else setStatus('❌ 请先取消或等待任务完成', 'error');
+                        currentTimeout = setTimeout(function() {
+                            if (openState === 'opening') openNext();
+                        }, delay);
+                    } else {
+                        finishTask(false);
+                    }
+                } else {
+                    setStatus('❌ 请先取消或等待任务完成', 'error');
+                }
             });
 
-            // 设置监听
-            delayToggle.addEventListener('change', function() { enableDelay = delayToggle.checked; debouncedSave(); });
-            delayInput.addEventListener('input', function() {
-                var v = parseInt(delayInput.value, 10); if (isNaN(v) || v < 1) v = 1;
-                delayInput.value = v; delaySeconds = v; debouncedSave();
+            // ---------- 设置监听 ----------
+            delayToggle.addEventListener('change', function() {
+                enableDelay = delayToggle.checked;
+                debouncedSave();
             });
-            autoClearToggle.addEventListener('change', function() { autoClearEnabled = autoClearToggle.checked; debouncedSave(); });
+            delayInput.addEventListener('input', function() {
+                var value = parseInt(delayInput.value, 10);
+                if (isNaN(value) || value < 1) value = 1;
+                delayInput.value = value;
+                delaySeconds = value;
+                debouncedSave();
+            });
+            autoClearToggle.addEventListener('change', function() {
+                autoClearEnabled = autoClearToggle.checked;
+                debouncedSave();
+            });
             urlInput.addEventListener('input', debouncedSave);
             window.addEventListener('beforeunload', immediateSave);
-            window.addEventListener('visibilitychange', function() { if (document.hidden) immediateSave(); });
+            window.addEventListener('visibilitychange', function() {
+                if (document.hidden) immediateSave();
+            });
 
-            // 初始化
+            // ---------- 初始化 ----------
             function initializeApp() {
                 loadState().then(function(state) {
                     applyLoadedState(state);
-                    updateButtons(); setStatus('就绪'); urlInput.focus();
-                }).catch(function() {
+                    updateButtons();
+                    setStatus('就绪');
+                    urlInput.focus();
+                }).catch(function(err) {
+                    console.error('加载状态失败', err);
                     urlInput.value = 'https://www.google.com\nhttps://www.github.com\nhttps://www.stackoverflow.com';
-                    updateButtons(); setStatus('就绪 (新会话)');
-                }).finally(function() { if (loadingOverlay) loadingOverlay.classList.add('hidden'); });
+                    updateButtons();
+                    setStatus('就绪 (新会话)');
+                }).finally(function() {
+                    if (loadingOverlay) {
+                        loadingOverlay.classList.add('hidden');
+                    }
+                });
+
+                // 尝试申请持久存储（静默）
                 requestPersistence();
             }
-            if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initializeApp);
-            else initializeApp();
+
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', initializeApp);
+            } else {
+                initializeApp();
+            }
         })();
     </script>
 </body>
